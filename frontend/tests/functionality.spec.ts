@@ -1,5 +1,4 @@
 import { expect, test } from '@playwright/test'
-import { readFile } from 'node:fs/promises'
 
 type ModuleCase = {
   key: string

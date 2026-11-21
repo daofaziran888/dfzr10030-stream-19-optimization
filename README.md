@@ -75,5 +75,35 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 阈值审计导出（流式质检）
+
+历史导出 `GET /api/data_quality/export` 仍只含规则行，列顺序不变；样本、执行批次和
+执行时实际适用的阈值放在独立的阈值审计包里，由 `app/services/quality_audit.py` 维护。
+
+调用链：`data_quality` 规则 → 质量样本（`fixtures.QUALITY_SAMPLES` 的采集口径）
+→ 阈值版本 → 执行批次 → 审计包 → `pipeline_orch` 复核。
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/data_quality/audit/rules` | 规则与当前阈值版本 |
+| `GET/POST /api/data_quality/audit/rules/{rule}/thresholds` | 查看 / 追加阈值版本（旧版本保留） |
+| `GET /api/data_quality/audit/samples` | 质量样本、样本来路、采集时间、缺测原因 |
+| `POST /api/data_quality/audit/executions` | 建执行批次，冻结当时生效的阈值快照 |
+| `POST /api/data_quality/audit/executions/{id}/seal` | 封包，固化截止前到达的样本 |
+| `POST /api/data_quality/audit/executions/{id}/samples` | 补录迟到样本（标记迟到、不计入统计） |
+| `GET /api/data_quality/audit/executions/{id}/package` | 下载审计包 CSV/JSON |
+| `GET /api/data_quality/audit/executions/{id}/manifest` | 包的封包口径与完整度 |
+| `POST /api/data_quality/audit/executions/{id}/replay` | 读包重算并把复核结果回写审计清单 |
+| `GET /api/data_quality/audit/reviews` | 审计清单（含导出时的证据位置） |
+| `POST /api/pipeline/quality-replay` | 管道编排触发同一条复核管道 |
+
+审计包每行都带 `执行批次`、`采集时间`、`证据位置`；样本行另外记录 `当时阈值版本`
+与当时的上下限。`当时*` 字段冻结不可改，`当前*` 字段用于说明按今天的阈值会怎么判，
+因此先改阈值再审计旧批次时，旧判断仍然可解释。缺测行 `是否计入统计=否`，
+迟到补录行 `迟到=是`、`是否计入统计=否`，都不会被算成合格记录。
+
+`GET .../package?interrupt_after=N` 模拟落盘中断：已写行进入归档并返回 503，
+重新请求同一执行从断点续写；同一执行重复导出、补录或复核都不会产生重复审计行。
+
 领域：数据工程
 子方向：数仓与数据湖

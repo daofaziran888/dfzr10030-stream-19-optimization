@@ -8,6 +8,7 @@
       <div class="page-actions">
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">登记质检规则</button>
         <button class="btn" data-testid="export" type="button" @click="exportRows">导出流式质检清单</button>
+        <button class="btn" data-testid="audit-export" type="button" @click="exportAuditPackage">导出阈值审计包</button>
       </div>
     </header>
 
@@ -125,6 +126,27 @@ async function exportRows() {
     URL.revokeObjectURL(url)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '导出失败'
+  }
+}
+
+// 阈值审计包：新建一个执行批次并下载；包内含样本、采集时间、所属批次与当时阈值。
+// 中断续写与迟到补录走同一执行编号，重试只补缺失行，不会把审计行写重。
+async function exportAuditPackage() {
+  errorMessage.value = ''
+  try {
+    const created = await request(`${ENDPOINT}/audit/executions`, { method: 'POST', body: '{}' })
+    if (!created.ok) throw new Error('创建执行批次失败，请稍后重试')
+    const { execution } = await created.json()
+    const response = await request(`${ENDPOINT}/audit/executions/${execution.execution_id}/package`)
+    if (!response.ok) throw new Error('阈值审计包导出失败，请稍后重试')
+    const url = URL.createObjectURL(await response.blob())
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${execution.execution_id}-package.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '阈值审计包导出失败'
   }
 }
 

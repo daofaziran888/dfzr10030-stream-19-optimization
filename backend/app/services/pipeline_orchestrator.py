@@ -11,9 +11,10 @@ from typing import Any
 
 from app.fixtures import (
     SOURCE_EVENTS, TRANSFORM_RECORDS, WINDOW_CONFIGS,
-    RULE_TRIGGERS, METRIC_DEFS, QUALITY_SAMPLES,
+    RULE_TRIGGERS, METRIC_DEFS,
     PARTITION_STATS, EVENT_ROUTES,
 )
+from app.services.quality_audit import quality_audit
 from app.store import store
 
 
@@ -141,19 +142,70 @@ def run_metric_sink_pipeline() -> dict:
 
 
 # Pipeline 5: data_quality -> pipeline_orch
+def _quality_evidence_rows() -> list[dict]:
+    """从质检调用链取证据：样本、样本来路、采集时间与当时适用的阈值。"""
+    audit = quality_audit
+    rules = {rule["规则编号"]: rule for rule in audit.list_rules()}
+    rows: list[dict] = []
+    for sample in audit.list_samples():
+        rule_id = str(sample["rule_id"])
+        rule = rules.get(rule_id)
+        if rule is None:
+            continue
+        threshold = audit.threshold_at(rule_id, sample.get("sampled_at")) or audit.current_threshold(rule_id)
+        if threshold is None:
+            continue
+        value = _to_float(sample.get("value")) if sample.get("value") is not None else None
+        missing_reason = str(sample.get("missing_reason") or "")
+        if value is None and not missing_reason:
+            missing_reason = "实测值缺失"
+        lo = float(threshold["lower"])
+        hi = float(threshold["upper"])
+        if value is None:
+            verdict = "缺测"
+        else:
+            verdict = "合格" if lo <= value <= hi else "异常"
+        rows.append({
+            "样本编号": sample["sample_id"],
+            "规则编号": rule_id,
+            "监控对象": sample.get("object") or rule["监控对象"],
+            "检查项": sample.get("check_item") or rule["检查项"],
+            "样本来路": sample.get("provenance", ""),
+            "采集时间": sample.get("sampled_at", ""),
+            "到达时间": sample.get("arrived_at", ""),
+            "实测值": value,
+            "判定": verdict,
+            "缺测原因": missing_reason if verdict == "缺测" else "",
+            "阈值版本": threshold["version"],
+            "下限阈值": lo,
+            "上限阈值": hi,
+            "阈值归档时间": threshold.get("archived_at"),
+            "阈值字符串": f"[{lo}, {hi}]",
+            "是否计入统计": "是" if verdict in ("合格", "异常") else "否",
+        })
+    return rows
+
+
 def run_quality_scan() -> dict:
-    """质量扫描。"""
-    samples = list(QUALITY_SAMPLES)
+    """质量扫描：用每个样本采集时适用的阈值判定，并把证据一并带回。"""
+    evidence = _quality_evidence_rows()
     anomalies = []
     score = 100.0
-    for s in samples:
-        cv = _to_float(s["当前值"])
-        lo = _to_float(s["阈值下限"])
-        hi = _to_float(s["阈值上限"])
-        ok = lo <= cv <= hi
-        if not ok:
-            anomalies.append({"规则": s["规则编号"], "对象": s["监控对象"], "当前值": cv, "阈值": f"[{lo}, {hi}]"})
+    for row in evidence:
+        if row["判定"] == "异常":
+            anomalies.append({
+                "规则": row["规则编号"],
+                "对象": row["监控对象"],
+                "当前值": row["实测值"],
+                "阈值": row["阈值字符串"],
+                "阈值版本": row["阈值版本"],
+                "样本编号": row["样本编号"],
+                "采集时间": row["采集时间"],
+            })
             score -= 25.0
+
+    missing = sum(1 for row in evidence if row["判定"] == "缺测")
+    scored_rows = [row for row in evidence if row["是否计入统计"] == "是"]
 
     # 扫描 store 模块 abnormal 标记
     mod_issues = []
@@ -164,9 +216,46 @@ def run_quality_scan() -> dict:
         if ab:
             mod_issues.append({"module": mod, "abnormal": ab})
 
-    result = {"quality_score": max(0, score), "anomalies": anomalies, "module_issues": mod_issues}
+    result = {
+        "quality_score": max(0, score),
+        "anomalies": anomalies,
+        "module_issues": mod_issues,
+        "samples": evidence,
+        "missing_samples": missing,
+        "scored_samples": len(scored_rows),
+    }
     _wr("quality_scan", {"source": ["data_quality"], "target": "_global", "payload": result})
     return result
+
+
+# Pipeline 8: data_quality(审计包) -> pipeline_orch
+def run_quality_replay_pipeline(execution_id: str | None = None) -> dict:
+    """读阈值审计导出包、实际重新执行校验，并把复核结果回写审计清单。
+
+    不传 execution_id 时，对最近一个已封包的执行批次做复核。
+    """
+    if execution_id is None:
+        executions = quality_audit.list_executions()
+        if not executions:
+            resealed = quality_audit.create_execution()
+            execution_id = resealed["execution_id"]
+        else:
+            execution_id = executions[0]["execution_id"]
+    if quality_audit.get_execution(execution_id) is None:
+        raise KeyError(f"执行批次 {execution_id} 不存在")
+    reviewed = quality_audit.replay(execution_id)
+    payload = {
+        "execution_id": reviewed["execution_id"],
+        "batch_no": reviewed["batch_no"],
+        "package_version": reviewed["package_version"],
+        "evidence_location": reviewed["evidence_location"],
+        "summary": reviewed["review"],
+        "rows": reviewed["rows"],
+    }
+    _wr("quality_audit_replay", {
+        "source": ["data_quality"], "target": "pipeline_orch", "payload": payload,
+    })
+    return payload
 
 
 # Pipeline 6: grp_partition -> backpressure
